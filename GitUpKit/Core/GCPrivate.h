@@ -118,6 +118,7 @@ extern NSString* GCGitOIDToSHA1(const git_oid* oid);
 extern BOOL GCGitOIDFromSHA1(NSString* sha1, git_oid* oid, NSError** error);
 extern BOOL GCGitOIDFromSHA1Prefix(NSString* prefix, git_oid* oid, NSError** error);
 extern NSData* GCCleanedUpCommitMessage(NSString* message);
+extern GCCommit* GCCreateCommitWithOptionalSignature(GCRepository* repository, git_tree* tree, const git_commit** parents, NSUInteger count, const git_signature* author, const git_signature* committer, const char* messageEncoding, const char* message, NSError** error);
 extern GCCommit* GCCreateCommitFromTreeWithOptionalSignature(GCRepository* repository, git_tree* tree, const git_commit** parents, NSUInteger count, const git_signature* author, NSString* message, NSError** error);
 extern GCCommit* GCCreateCommitFromCommitWithIndexAndOptionalSignature(GCRepository* repository, git_commit* commit, git_index* index, NSString* message, NSError** error);
 extern NSString* GCUserFromSignature(const git_signature* signature);
@@ -266,6 +267,9 @@ extern int git_submodule_foreach_block(git_repository* repo, int (^block)(git_su
 - (BOOL)exportBlobWithOID:(const git_oid*)oid toPath:(NSString*)path error:(NSError**)error;
 #if !TARGET_OS_IPHONE
 - (NSString*)getPATHUsingShell:(NSString*)shell error:(NSError**)error;
+- (void)beginCommitSigningSession;  // Signed commits created until the matching -endCommitSigningSession reuse the same login shell PATH
+- (void)endCommitSigningSession;
+- (NSString*)commitSigningPATH:(NSError**)error;  // Looked up again for every signed commit unless a commit signing session is active
 #endif
 @end
 

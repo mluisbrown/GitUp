@@ -20,4 +20,5 @@
 
 extern NSString* GCCommitSignature(GCCommit* commit);
 extern BOOL GCCommitHasSSHSignature(GCCommit* commit);
+extern BOOL GCCommitHasPGPSignature(GCCommit* commit);
 extern BOOL GCConfigureSSHSigningWithKeyPath(GCRepository* repository, NSString* keyPath);
