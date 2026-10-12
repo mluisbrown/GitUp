@@ -102,6 +102,8 @@ static int _GitLFSApply(git_filter* self, void** payload, git_buf* to, const git
   BOOL _didTrySSHAgent;
   NSMutableArray* _privateKeyList;
   NSUInteger _privateKeyIndex;
+  NSUInteger _commitSigningSessionDepth;
+  NSString* _commitSigningSessionPATH;
 #endif
 
   BOOL _hasFetchProgressDelegate;
@@ -374,6 +376,30 @@ static int _ReferenceForEachCallback(const char* refname, void* payload) {
     return nil;
   }
   return [[[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] stringByTrimmingCharactersInSet:[NSCharacterSet newlineCharacterSet]];
+}
+
+- (void)beginCommitSigningSession {
+  _commitSigningSessionDepth += 1;
+}
+
+- (void)endCommitSigningSession {
+  XLOG_DEBUG_CHECK(_commitSigningSessionDepth > 0);
+  if (_commitSigningSessionDepth && (--_commitSigningSessionDepth == 0)) {
+    _commitSigningSessionPATH = nil;
+  }
+}
+
+- (NSString*)commitSigningPATH:(NSError**)error {
+  if (_commitSigningSessionPATH) {
+    return _commitSigningSessionPATH;
+  }
+  NSString* shell = NSProcessInfo.processInfo.environment[@"SHELL"];
+  NSString* path = [self getPATHUsingShell:shell error:error] ?: [self getPATHUsingShell:@"/bin/sh" error:error];
+  XLOG_DEBUG_CHECK(path);
+  if (_commitSigningSessionDepth) {
+    _commitSigningSessionPATH = path;
+  }
+  return path;
 }
 
 - (BOOL)runHookWithName:(NSString*)name arguments:(NSArray*)arguments standardInput:(NSString*)standardInput error:(NSError**)error {

@@ -20,6 +20,7 @@
 #import "GCTestCase.h"
 #import "GCCommitSigningTestHelpers.h"
 #import "GCRepository+Index.h"
+#import "GCRepository+Bare.h"
 
 static BOOL _WriteLocalConfigOption(GCRepository* repository, NSString* variable, NSString* value) {
   return [repository writeConfigOptionForLevel:kGCConfigLevel_Local variable:variable withValue:value error:NULL];
@@ -241,6 +242,143 @@ cleanup:
   NSError* error;
   XCTAssertNil(_CreateCommitFromRepositoryIndex(self.repository, @"Failing GPG", &error));
   XCTAssertTrue([error.localizedDescription containsString:@"non-zero status"]);
+}
+
+- (void)testCommitSigningUsesUTF8CommitterIdentityAsDefaultKey {
+  NSString* argumentsPath = [self.temporaryPath stringByAppendingPathComponent:@"utf8-arguments"];
+  NSString* signer = _CreateFakeGPGSigner(self.temporaryPath, @"PGP SIGNATURE", YES, 0, argumentsPath);
+
+  XCTAssertNotNil(signer);
+  XCTAssertTrue(_WriteLocalConfigOption(self.repository, @"commit.gpgsign", @"true"));
+  XCTAssertTrue(_WriteLocalConfigOption(self.repository, @"gpg.program", signer));
+  [self updateFileAtPath:@"utf8.txt" withString:@"utf8\n"];
+  XCTAssertTrue([self.repository addFileToIndex:@"utf8.txt" error:NULL]);
+
+  git_index* index = [self.repository reloadRepositoryIndex:NULL];
+  git_oid treeOID;
+  git_tree* tree = NULL;
+  git_signature* committer = NULL;
+  XCTAssertEqual(git_index_write_tree_to(&treeOID, index, self.repository.private), GIT_OK);
+  XCTAssertEqual(git_tree_lookup(&tree, self.repository.private, &treeOID), GIT_OK);
+  XCTAssertEqual(git_signature_now(&committer, "Jos\u00E9 \u0141ukasz", "bot@example.com"), GIT_OK);
+  GCCommit* commit = GCCreateCommitWithOptionalSignature(self.repository, tree, NULL, 0, committer, committer, NULL, "UTF-8 committer\n", NULL);
+  git_signature_free(committer);
+  git_tree_free(tree);
+  git_index_free(index);
+  XCTAssertNotNil(commit);
+  XCTAssertTrue(GCCommitHasOpenPGPSignature(commit));
+  // NSTask decomposes non-ASCII arguments (NFD) before passing them on, so compare canonically equivalent forms.
+  XCTAssertEqualObjects([_RecordedArguments(argumentsPath).lastObject precomposedStringWithCanonicalMapping], @"Jos\u00E9 \u0141ukasz <bot@example.com>");
+}
+
+- (void)testCommitSigningGPGErrorOmitsStatusLinesAndSuggestsPinentry {
+  NSString* signer = [self.temporaryPath stringByAppendingPathComponent:@"pinentry-gpg"];
+  NSArray* lines = @[
+    @"#!/bin/sh",
+    @"/bin/cat >/dev/null",
+    @"echo '[GNUPG:] KEY_CONSIDERED 0123456789ABCDEF0123456789ABCDEF01234567 2' >&2",
+    @"echo 'gpg: signing failed: Inappropriate ioctl for device' >&2",
+    @"echo '[GNUPG:] FAILURE sign 83918950' >&2",
+    @"exit 2",
+    @""
+  ];
+  XCTAssertTrue(_WriteExecutable(signer, [lines componentsJoinedByString:@"\n"]));
+  XCTAssertTrue(_WriteLocalConfigOption(self.repository, @"commit.gpgsign", @"true"));
+  XCTAssertTrue(_WriteLocalConfigOption(self.repository, @"gpg.program", signer));
+  [self updateFileAtPath:@"pinentry.txt" withString:@"pinentry\n"];
+  XCTAssertTrue([self.repository addFileToIndex:@"pinentry.txt" error:NULL]);
+
+  NSError* error;
+  XCTAssertNil(_CreateCommitFromRepositoryIndex(self.repository, @"Pinentry", &error));
+  XCTAssertTrue([error.localizedDescription containsString:@"Inappropriate ioctl for device"]);
+  XCTAssertTrue([error.localizedDescription containsString:@"pinentry-mac"]);
+  XCTAssertFalse([error.localizedDescription containsString:@"[GNUPG:]"]);
+}
+
+- (void)testCommitSigningSignsRewrittenCommits {
+  GCCommit* commit1 = [self makeCommitWithUpdatedFileAtPath:@"rewrite.txt" string:@"1\n" message:@"1"];
+  GCCommit* commit2 = [self makeCommitWithUpdatedFileAtPath:@"rewrite.txt" string:@"2\n" message:@"2"];
+  GCCommit* commit3 = [self makeCommitWithUpdatedFileAtPath:@"other.txt" string:@"3\n" message:@"3"];
+  XCTAssertNil(GCCommitSignature(commit2));
+
+  NSString* signer = _CreateFakeSSHSigner(self.temporaryPath, 0);
+  XCTAssertNotNil(signer);
+  XCTAssertTrue(_WriteLocalConfigOption(self.repository, @"commit.gpgsign", @"true"));
+  XCTAssertTrue(_WriteLocalConfigOption(self.repository, @"gpg.format", @"ssh"));
+  XCTAssertTrue(_WriteLocalConfigOption(self.repository, @"gpg.ssh.program", signer));
+  XCTAssertTrue(_WriteLocalConfigOption(self.repository, @"user.signingkey", @"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIRewriteKey test@example.com"));
+
+  // Reword keeps the original parents
+  GCCommit* reworded = [self.repository copyCommit:commit2 withUpdatedMessage:@"2 reworded" updatedParents:nil updatedTreeFromIndex:nil updateCommitter:YES error:NULL];
+  XCTAssertNotNil(reworded);
+  XCTAssertTrue(GCCommitHasSSHSignature(reworded));
+  XCTAssertEqualObjects([self.repository lookupParentsForCommit:reworded error:NULL], @[ commit1 ]);
+  XCTAssertEqualObjects(reworded.message, @"2 reworded");
+
+  // Replay onto new parents
+  GCCommit* replayed = [self.repository replayCommit:commit3
+                                          ontoCommit:reworded
+                                  withAncestorCommit:commit2
+                                      updatedMessage:nil
+                                      updatedParents:@[ reworded ]
+                                     updateCommitter:YES
+                                       skipIdentical:NO
+                                     conflictHandler:NULL
+                                               error:NULL];
+  XCTAssertNotNil(replayed);
+  XCTAssertTrue(GCCommitHasSSHSignature(replayed));
+  XCTAssertEqualObjects([self.repository lookupParentsForCommit:replayed error:NULL], @[ reworded ]);
+  XCTAssertEqualObjects(replayed.message, commit3.message);
+
+  // Squash
+  GCCommit* squashed = [self.repository squashCommitOntoParent:commit2 withUpdatedMessage:@"Squashed" error:NULL];
+  XCTAssertNotNil(squashed);
+  XCTAssertTrue(GCCommitHasSSHSignature(squashed));
+
+  // Cherry-pick goes through the merge code path
+  GCCommit* picked = [self.repository cherryPickCommit:commit3 againstCommit:commit1 withAncestorCommit:commit2 message:@"Picked" conflictHandler:NULL error:NULL];
+  XCTAssertNotNil(picked);
+  XCTAssertTrue(GCCommitHasSSHSignature(picked));
+}
+
+- (void)testCommitSigningSessionReusesPATH {
+  NSString* pathLookups = [self.temporaryPath stringByAppendingPathComponent:@"session-path-lookups"];
+  NSString* shell = [self.temporaryPath stringByAppendingPathComponent:@"session-path-shell"];
+  NSString* shellContents = [NSString stringWithFormat:@"#!/bin/sh\nprintf x >> '%@'\necho \"$PATH\"\n", pathLookups];
+  XCTAssertTrue(_WriteExecutable(shell, shellContents));
+
+  NSString* signer = _CreateFakeSSHSigner(self.temporaryPath, 0);
+  XCTAssertNotNil(signer);
+  XCTAssertTrue(_WriteLocalConfigOption(self.repository, @"commit.gpgsign", @"true"));
+  XCTAssertTrue(_WriteLocalConfigOption(self.repository, @"gpg.format", @"ssh"));
+  XCTAssertTrue(_WriteLocalConfigOption(self.repository, @"gpg.ssh.program", signer));
+  XCTAssertTrue(_WriteLocalConfigOption(self.repository, @"user.signingkey", @"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAISessionKey test@example.com"));
+
+  const char* previousShellValue = getenv("SHELL");
+  NSString* previousShell = previousShellValue ? [NSString stringWithUTF8String:previousShellValue] : nil;
+  setenv("SHELL", shell.fileSystemRepresentation, 1);
+  @try {
+    [self.repository beginCommitSigningSession];
+    for (NSString* name in @[ @"session-1.txt", @"session-2.txt" ]) {
+      [self updateFileAtPath:name withString:name];
+      XCTAssertTrue([self.repository addFileToIndex:name error:NULL]);
+      GCCommit* commit = _CreateCommitFromRepositoryIndex(self.repository, name, NULL);
+      XCTAssertTrue(GCCommitHasSSHSignature(commit));
+    }
+    [self.repository endCommitSigningSession];
+    XCTAssertEqual([[NSString stringWithContentsOfFile:pathLookups encoding:NSUTF8StringEncoding error:NULL] length], 1);
+
+    [self updateFileAtPath:@"session-3.txt" withString:@"3"];
+    XCTAssertTrue([self.repository addFileToIndex:@"session-3.txt" error:NULL]);
+    XCTAssertTrue(GCCommitHasSSHSignature(_CreateCommitFromRepositoryIndex(self.repository, @"After session", NULL)));
+    XCTAssertEqual([[NSString stringWithContentsOfFile:pathLookups encoding:NSUTF8StringEncoding error:NULL] length], 2);
+  } @finally {
+    if (previousShell) {
+      setenv("SHELL", previousShell.fileSystemRepresentation, 1);
+    } else {
+      unsetenv("SHELL");
+    }
+  }
 }
 
 - (void)testCommitSigningRequiresSSHKey {

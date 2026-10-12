@@ -97,13 +97,6 @@ static BOOL _CommitSigningFormat(GCRepository* repository, GCCommitSigningFormat
   return YES;
 }
 
-static NSString* _CommitSigningPATH(GCRepository* repository, NSError** error) {
-  NSString* shell = NSProcessInfo.processInfo.environment[@"SHELL"];
-  NSString* path = [repository getPATHUsingShell:shell error:error] ?: [repository getPATHUsingShell:@"/bin/sh" error:error];
-  XLOG_DEBUG_CHECK(path);
-  return path;
-}
-
 static BOOL _LooksLikeInlineSSHKey(NSString* key) {
   return [key hasPrefix:@"ssh-"] || [key hasPrefix:@"ecdsa-"] || [key hasPrefix:@"sk-"];
 }
@@ -187,7 +180,7 @@ static NSString* _SSHSigningKeyPath(GCRepository* repository, NSString* taskPath
 }
 
 static NSString* _SSHSignatureForCommitBuffer(GCRepository* repository, NSData* commitBuffer, NSError** error) {
-  NSString* path = _CommitSigningPATH(repository, error);
+  NSString* path = [repository commitSigningPATH:error];
   if (!path) {
     return nil;
   }
@@ -254,11 +247,30 @@ static NSString* _GPGSigningKey(GCRepository* repository, const git_signature* c
   }
   // Git falls back to the committer identity so GnuPG picks the key matching it rather
   // than whichever key GnuPG happens to consider its own default.
-  return [NSString stringWithFormat:@"%s <%s>", committer->name, committer->email];
+  return GCUserFromSignature(committer);
+}
+
+static NSString* _GPGErrorOutput(NSData* stdoutData, NSData* stderrData) {
+  // Drop the "[GNUPG:] ..." status lines that "--status-fd=2" mixes into stderr, keeping only the human-readable output.
+  NSMutableArray* lines = [[NSMutableArray alloc] init];
+  for (NSString* line in [_StringFromTaskOutput(stderrData) componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]]) {
+    if (line.length && ![line hasPrefix:@"[GNUPG:]"]) {
+      [lines addObject:line];
+    }
+  }
+  NSString* output = lines.count ? [lines componentsJoinedByString:@"\n"] : _StringFromTaskOutput(stdoutData);
+  if (!output.length) {
+    return @"";
+  }
+  NSString* reason = [NSString stringWithFormat:@": %@", output];
+  if (([output rangeOfString:@"pinentry" options:NSCaseInsensitiveSearch].location != NSNotFound) || [output containsString:@"Inappropriate ioctl for device"]) {
+    reason = [reason stringByAppendingString:@" (GitUp cannot prompt for a passphrase in a terminal so gpg-agent must be configured with a graphical pinentry program like pinentry-mac)"];
+  }
+  return reason;
 }
 
 static NSString* _GPGSignatureForCommitBuffer(GCRepository* repository, NSData* commitBuffer, GCCommitSigningFormat format, const git_signature* committer, NSError** error) {
-  NSString* path = _CommitSigningPATH(repository, error);
+  NSString* path = [repository commitSigningPATH:error];
   if (!path) {
     return nil;
   }
@@ -273,7 +285,7 @@ static NSString* _GPGSignatureForCommitBuffer(GCRepository* repository, NSData* 
   }
   if (status != 0) {
     if (error) {
-      *error = _TaskFailureError(@"GPG commit signer", status, stdoutData, stderrData);
+      *error = GCNewError(kGCErrorCode_Generic, [NSString stringWithFormat:@"GPG commit signer exited with non-zero status (%i)%@", status, _GPGErrorOutput(stdoutData, stderrData)]);
     }
     return nil;
   }
@@ -283,9 +295,7 @@ static NSString* _GPGSignatureForCommitBuffer(GCRepository* repository, NSData* 
   NSString* statusOutput = [[NSString alloc] initWithData:stderrData encoding:NSUTF8StringEncoding];
   if (![statusOutput containsString:@"[GNUPG:] SIG_CREATED "]) {
     if (error) {
-      NSString* output = _StringFromTaskOutput(stderrData.length ? stderrData : stdoutData);
-      NSString* reason = output.length ? [NSString stringWithFormat:@": %@", output] : @"";
-      *error = GCNewError(kGCErrorCode_Generic, [NSString stringWithFormat:@"GPG commit signer did not report a created signature%@", reason]);
+      *error = GCNewError(kGCErrorCode_Generic, [NSString stringWithFormat:@"GPG commit signer did not report a created signature%@", _GPGErrorOutput(stdoutData, stderrData)]);
     }
     return nil;
   }
@@ -302,13 +312,9 @@ static NSString* _GPGSignatureForCommitBuffer(GCRepository* repository, NSData* 
 
 #endif
 
-GCCommit* GCCreateCommitFromTreeWithOptionalSignature(GCRepository* repository, git_tree* tree, const git_commit** parents, NSUInteger count, const git_signature* author, NSString* message, NSError** error) {
+GCCommit* GCCreateCommitWithOptionalSignature(GCRepository* repository, git_tree* tree, const git_commit** parents, NSUInteger count, const git_signature* author, const git_signature* committer, const char* messageEncoding, const char* message, NSError** error) {
   GCCommit* commit = nil;
-  const git_signature* authorSignature = NULL;
-  git_signature* signature = NULL;
   git_commit* newCommit = NULL;
-  NSData* cleanedMessage = nil;
-  const char* cleanedMessageBytes = NULL;
 #if !TARGET_OS_IPHONE
   git_buf commitBuffer = {0};
   NSData* commitData = nil;
@@ -317,22 +323,18 @@ GCCommit* GCCreateCommitFromTreeWithOptionalSignature(GCRepository* repository, 
 #endif
 
   git_oid oid;
-  CALL_LIBGIT2_FUNCTION_GOTO(cleanup, git_signature_default, &signature, repository.private);
-  authorSignature = author ?: signature;
-  cleanedMessage = GCCleanedUpCommitMessage(message);
-  cleanedMessageBytes = (const char*)cleanedMessage.bytes;
 #if !TARGET_OS_IPHONE
   if (!_CommitSigningFormat(repository, &signingFormat, error)) {
     goto cleanup;
   }
 
   if (signingFormat != kGCCommitSigningFormat_None) {
-    CALL_LIBGIT2_FUNCTION_GOTO(cleanup, git_commit_create_buffer, &commitBuffer, repository.private, authorSignature, signature, NULL, cleanedMessageBytes, tree, count, parents);
+    CALL_LIBGIT2_FUNCTION_GOTO(cleanup, git_commit_create_buffer, &commitBuffer, repository.private, author, committer, messageEncoding, message, tree, count, parents);
     commitData = [[NSData alloc] initWithBytes:commitBuffer.ptr length:commitBuffer.size];
     if (signingFormat == kGCCommitSigningFormat_SSH) {
       commitSignature = _SSHSignatureForCommitBuffer(repository, commitData, error);
     } else {
-      commitSignature = _GPGSignatureForCommitBuffer(repository, commitData, signingFormat, signature, error);
+      commitSignature = _GPGSignatureForCommitBuffer(repository, commitData, signingFormat, committer, error);
     }
     if (!commitSignature) {
       goto cleanup;
@@ -341,7 +343,7 @@ GCCommit* GCCreateCommitFromTreeWithOptionalSignature(GCRepository* repository, 
     CALL_LIBGIT2_FUNCTION_GOTO(cleanup, git_commit_create_with_signature, &oid, repository.private, commitBuffer.ptr, commitSignature.UTF8String, "gpgsig");
   } else {
 #endif
-    CALL_LIBGIT2_FUNCTION_GOTO(cleanup, git_commit_create, &oid, repository.private, NULL, authorSignature, signature, NULL, cleanedMessageBytes, tree, count, parents);
+    CALL_LIBGIT2_FUNCTION_GOTO(cleanup, git_commit_create, &oid, repository.private, NULL, author, committer, messageEncoding, message, tree, count, parents);
 #if !TARGET_OS_IPHONE
   }
 #endif
@@ -354,6 +356,18 @@ cleanup:
 #if !TARGET_OS_IPHONE
   git_buf_free(&commitBuffer);
 #endif
+  return commit;
+}
+
+GCCommit* GCCreateCommitFromTreeWithOptionalSignature(GCRepository* repository, git_tree* tree, const git_commit** parents, NSUInteger count, const git_signature* author, NSString* message, NSError** error) {
+  GCCommit* commit = nil;
+  git_signature* signature = NULL;
+  NSData* cleanedMessage = GCCleanedUpCommitMessage(message);
+
+  CALL_LIBGIT2_FUNCTION_GOTO(cleanup, git_signature_default, &signature, repository.private);
+  commit = GCCreateCommitWithOptionalSignature(repository, tree, parents, count, author ?: signature, signature, NULL, (const char*)cleanedMessage.bytes, error);
+
+cleanup:
   git_signature_free(signature);
   return commit;
 }

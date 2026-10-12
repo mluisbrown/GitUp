@@ -363,19 +363,7 @@ cleanup:
                            author:(const git_signature*)author
                           message:(NSString*)message
                             error:(NSError**)error {
-  GCCommit* commit = nil;
-  git_signature* signature = NULL;
-
-  git_oid oid;
-  CALL_LIBGIT2_FUNCTION_GOTO(cleanup, git_signature_default, &signature, self.private);
-  CALL_LIBGIT2_FUNCTION_GOTO(cleanup, git_commit_create, &oid, self.private, NULL, author ? author : signature, signature, NULL, GCCleanedUpCommitMessage(message).bytes, tree, count, parents);
-  git_commit* newCommit = NULL;
-  CALL_LIBGIT2_FUNCTION_GOTO(cleanup, git_commit_lookup, &newCommit, self.private, &oid);
-  commit = [[GCCommit alloc] initWithRepository:self commit:newCommit];
-
-cleanup:
-  git_signature_free(signature);
-  return commit;
+  return GCCreateCommitFromTreeWithOptionalSignature(self, tree, parents, count, author, message, error);
 }
 
 - (GCCommit*)createCommitFromIndex:(git_index*)index
@@ -396,22 +384,6 @@ cleanup:
 cleanup:
   git_tree_free(tree);
   return commit;
-}
-
-static const git_oid* _CommitParentCallback_Parents(size_t idx, void* payload) {
-  NSArray* parents = (__bridge NSArray*)payload;
-  if (idx < parents.count) {
-    return git_commit_id([(GCCommit*)parents[idx] private]);
-  }
-  return NULL;
-}
-
-static const git_oid* _CommitParentCallback_Commit(size_t idx, void* payload) {
-  git_commit* commit = (git_commit*)payload;
-  if (idx < git_commit_parentcount(commit)) {
-    return git_commit_parent_id(commit, (unsigned int)idx);
-  }
-  return NULL;
 }
 
 - (GCCommit*)createCommitFromCommit:(git_commit*)commit
@@ -435,26 +407,46 @@ static const git_oid* _CommitParentCallback_Commit(size_t idx, void* payload) {
                      updatedParents:(NSArray*)parents
                     updateCommitter:(BOOL)updateCommitter
                               error:(NSError**)error {
-  git_commit* newCommit = NULL;
+  GCCommit* newCommit = nil;
   git_signature* signature = NULL;
-  git_oid oid;
+  git_tree* ownTree = NULL;
+  NSData* cleanedMessage = message ? GCCleanedUpCommitMessage(message) : nil;
+  NSUInteger count = parents ? parents.count : git_commit_parentcount(commit);
+  git_commit** parentCommits = count ? (git_commit**)calloc(count, sizeof(git_commit*)) : NULL;
+
+  if (count && !parentCommits) {
+    GC_SET_GENERIC_ERROR(@"Unable to allocate commit parent list");
+    goto cleanup;
+  }
+
+  // Creating commits from git_commit and git_tree objects requires them to be owned by this repository
+  for (NSUInteger i = 0; i < count; ++i) {
+    const git_oid* parentOID = parents ? git_commit_id([(GCCommit*)parents[i] private]) : git_commit_parent_id(commit, (unsigned int)i);
+    CALL_LIBGIT2_FUNCTION_GOTO(cleanup, git_commit_lookup, &parentCommits[i], self.private, parentOID);
+  }
+  CALL_LIBGIT2_FUNCTION_GOTO(cleanup, git_tree_lookup, &ownTree, self.private, git_tree_id(tree));
 
   if (updateCommitter) {
     CALL_LIBGIT2_FUNCTION_GOTO(cleanup, git_signature_default, &signature, self.private);
   }
 
-  CALL_LIBGIT2_FUNCTION_GOTO(cleanup, git_commit_create_from_callback, &oid, self.private, NULL,
-                             git_commit_author(commit),
-                             updateCommitter ? signature : git_commit_committer(commit),
-                             message ? NULL : git_commit_message_encoding(commit), message ? GCCleanedUpCommitMessage(message).bytes : git_commit_message(commit),
-                             git_tree_id(tree),
-                             parents ? _CommitParentCallback_Parents : _CommitParentCallback_Commit, parents ? (__bridge void*)parents : (void*)commit);
-  CALL_LIBGIT2_FUNCTION_GOTO(cleanup, git_commit_lookup, &newCommit, self.private, &oid);
-  XLOG_DEBUG_CHECK(!git_oid_equal(git_commit_id(newCommit), git_commit_id(commit)));
+  newCommit = GCCreateCommitWithOptionalSignature(self, ownTree, (const git_commit**)parentCommits, count,
+                                                  git_commit_author(commit),
+                                                  updateCommitter ? signature : git_commit_committer(commit),
+                                                  message ? NULL : git_commit_message_encoding(commit), message ? (const char*)cleanedMessage.bytes : git_commit_message(commit),
+                                                  error);
+  XLOG_DEBUG_CHECK(!newCommit || !git_oid_equal(git_commit_id(newCommit.private), git_commit_id(commit)));
 
 cleanup:
+  if (parentCommits) {
+    for (NSUInteger i = 0; i < count; ++i) {
+      git_commit_free(parentCommits[i]);
+    }
+    free(parentCommits);
+  }
+  git_tree_free(ownTree);
   git_signature_free(signature);
-  return newCommit ? [[GCCommit alloc] initWithRepository:self commit:newCommit] : nil;
+  return newCommit;
 }
 
 @end

@@ -810,7 +810,14 @@ static void _StreamCallback(ConstFSEventStreamRef streamRef, void* clientCallBac
   GCSnapshot* beforeSnapshot = reason ? [self takeSnapshot:error] : nil;
   if (!reason || beforeSnapshot) {
     CFAbsoluteTime time = CFAbsoluteTimeGetCurrent();
-    if (block(self, error)) {
+#if !TARGET_OS_IPHONE
+    [self beginCommitSigningSession];  // Operations like rebasing can create many signed commits so avoid looking up the PATH for each one
+#endif
+    BOOL blockSuccess = block(self, error);
+#if !TARGET_OS_IPHONE
+    [self endCommitSigningSession];
+#endif
+    if (blockSuccess) {
       XLOG_VERBOSE(@"Performed operation '%@' in \"%@\" in %.3f seconds", reason, self.repositoryPath, CFAbsoluteTimeGetCurrent() - time);
       GCSnapshot* afterSnapshot = reason ? [self takeSnapshot:error] : nil;
       if (!reason || afterSnapshot) {
