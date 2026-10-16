@@ -284,4 +284,31 @@
   [[NSFileManager defaultManager] removeItemAtPath:worktreePath error:NULL];
 }
 
+// The git-lfs tool used to be expected at /usr/local/bin/git-lfs only, so LFS files were
+// silently left unfiltered when it was installed elsewhere e.g. /opt/homebrew/bin (issue #805).
+- (void)testGitLFSCleanFilter {
+  NSString* shell = NSProcessInfo.processInfo.environment[@"SHELL"] ?: @"/bin/sh";
+  NSString* PATH = [self.repository getPATHUsingShell:shell error:NULL];
+  BOOL found = NO;
+  for (NSString* directory in [[PATH componentsSeparatedByString:@":"] arrayByAddingObjectsFromArray:@[ @"/opt/homebrew/bin", @"/usr/local/bin", @"/opt/local/bin" ]]) {
+    if (directory.length && [[NSFileManager defaultManager] isExecutableFileAtPath:[directory stringByAppendingPathComponent:@"git-lfs"]]) {
+      found = YES;
+      break;
+    }
+  }
+  if (!found) {
+    XCTSkip(@"git-lfs is not installed");
+  }
+
+  [self updateFileAtPath:@".gitattributes" withString:@"*.bin filter=lfs diff=lfs merge=lfs -text\n"];
+  [self updateFileAtPath:@"large.bin" withString:@"Hello LFS\n"];
+
+  GCIndex* index = [self.repository readRepositoryIndex:NULL];
+  XCTAssertNotNil(index);
+  XCTAssertTrue([self.repository addFileInWorkingDirectory:@"large.bin" toIndex:index error:NULL]);
+  NSData* data = [self.repository readContentsForFile:@"large.bin" inIndex:index error:NULL];
+  NSString* contents = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+  XCTAssertTrue([contents hasPrefix:@"version https://git-lfs.github.com/spec/v1\n"], @"%@", contents);
+}
+
 @end

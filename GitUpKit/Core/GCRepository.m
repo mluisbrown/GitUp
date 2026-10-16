@@ -21,14 +21,9 @@
 #import <pthread.h>
 #if !TARGET_OS_IPHONE
 #import <git2/sys/filter.h>
-#import <sys/stat.h>
 #endif
 
 #import "GCPrivate.h"
-
-#if !TARGET_OS_IPHONE
-static const char* _GitLFSPath = "/usr/local/bin/git-lfs";
-#endif
 
 static inline BOOL _IsDirectoryWritable(const char* path) {
   int status = access(path, W_OK);
@@ -56,6 +51,61 @@ static inline NSString* _MakeDirectoryPath(const char* path) {
 
 #if !TARGET_OS_IPHONE
 
+static NSString* _GetPATHUsingShell(NSString* shell, NSError** error) {
+  GCTask* task = [[GCTask alloc] initWithExecutablePath:shell];
+  NSData* data;
+  // `-l` is not supported with `-c` in all shells (tcsh), so try without.
+  // Some shells use quoting of $PATH to trigger POSIX compatibility behavior (fish).
+  // Not all shells support `-n` on `echo`.
+  if (![task runWithArguments:@[ @"-l", @"-c", @"echo \"$PATH\"" ] stdin:NULL stdout:&data stderr:NULL exitStatus:NULL error:error] && ![task runWithArguments:@[ @"-c", @"echo \"$PATH\"" ] stdin:NULL stdout:&data stderr:NULL exitStatus:NULL error:error]) {
+    return nil;
+  }
+  return [[[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] stringByTrimmingCharactersInSet:[NSCharacterSet newlineCharacterSet]];
+}
+
+// GUI apps don't inherit the user's shell PATH, so git-lfs is looked up in the login shell PATH first
+// and then in the usual install locations (Homebrew on Apple Silicon and Intel, MacPorts).
+// This is resolved lazily the first time a file with the "lfs" filter attribute is processed.
+static NSString* _GitLFSExecutablePath(NSString** outPATH) {
+  static NSString* executablePath = nil;
+  static NSString* PATH = nil;
+  static dispatch_once_t onceToken;
+  dispatch_once(&onceToken, ^{
+    @autoreleasepool {
+      PATH = _GetPATHUsingShell(NSProcessInfo.processInfo.environment[@"SHELL"], NULL) ?: _GetPATHUsingShell(@"/bin/sh", NULL);
+      NSMutableArray* directories = [[NSMutableArray alloc] init];
+      for (NSString* directory in [PATH componentsSeparatedByString:@":"]) {
+        if (directory.length) {
+          [directories addObject:directory];
+        }
+      }
+      [directories addObjectsFromArray:@[ @"/opt/homebrew/bin", @"/usr/local/bin", @"/opt/local/bin" ]];
+      NSFileManager* fileManager = [NSFileManager defaultManager];
+      for (NSString* directory in directories) {
+        NSString* path = [directory stringByAppendingPathComponent:@"git-lfs"];
+        if ([fileManager isExecutableFileAtPath:path]) {
+          executablePath = path;
+          break;
+        }
+      }
+      if (executablePath) {
+        XLOG_VERBOSE(@"Using git-lfs tool at \"%@\"", executablePath);
+      } else {
+        XLOG_WARNING(@"git-lfs tool not found");
+      }
+    }
+  });
+  if (outPATH) {
+    *outPATH = PATH;
+  }
+  return executablePath;
+}
+
+// Leave LFS files untouched (i.e. as pointer files) if git-lfs is not installed
+static int _GitLFSCheck(git_filter* self, void** payload, const git_filter_source* src, const char** attr_values) {
+  return _GitLFSExecutablePath(NULL) ? 0 : GIT_PASSTHROUGH;
+}
+
 static int _GitLFSApply(git_filter* self, void** payload, git_buf* to, const git_buf* from, const git_filter_source* src) {
   if (from->size > 0) {
     @autoreleasepool {
@@ -71,8 +121,16 @@ static int _GitLFSApply(git_filter* self, void** payload, git_buf* to, const git
       }
       [arguments addObject:@"--"];
       [arguments addObject:GCFileSystemPathFromGitPath(git_filter_source_path(src))];
-      GCTask* task = [[GCTask alloc] initWithExecutablePath:[NSString stringWithUTF8String:_GitLFSPath]];
+      NSString* PATH;
+      NSString* executablePath = _GitLFSExecutablePath(&PATH);
+      if (!executablePath) {
+        return GIT_PASSTHROUGH;
+      }
+      GCTask* task = [[GCTask alloc] initWithExecutablePath:executablePath];
       task.currentDirectoryPath = _MakeDirectoryPath(git_repository_workdir(git_filter_source_repo(src)));
+      if (PATH) {
+        task.additionalEnvironment = @{@"PATH" : PATH};  // git-lfs runs git itself so use the same PATH as the command line
+      }
       int status;
       NSData* stdinData = [[NSData alloc] initWithBytesNoCopy:from->ptr length:from->size freeWhenDone:NO];
       NSData* stdoutData;
@@ -120,14 +178,12 @@ static int _GitLFSApply(git_filter* self, void** payload, git_buf* to, const git
   assert(git_libgit2_init() >= 1);
 
 #if !TARGET_OS_IPHONE
-  struct stat info;
-  if (lstat(_GitLFSPath, &info) == 0) {
-    git_filter* filter = calloc(1, sizeof(git_filter));
-    filter->version = GIT_FILTER_VERSION;
-    filter->attributes = "filter=lfs";
-    filter->apply = _GitLFSApply;
-    assert(git_filter_register("lfs", filter, -1) == 0);  // Priority must be lower than CRLF and IDENT built-in filters
-  }
+  git_filter* filter = calloc(1, sizeof(git_filter));
+  filter->version = GIT_FILTER_VERSION;
+  filter->attributes = "filter=lfs";
+  filter->check = _GitLFSCheck;
+  filter->apply = _GitLFSApply;
+  assert(git_filter_register("lfs", filter, -1) == 0);  // Priority must be lower than CRLF and IDENT built-in filters
 #endif
 }
 
@@ -365,15 +421,7 @@ static int _ReferenceForEachCallback(const char* refname, void* payload) {
 }
 
 - (NSString*)getPATHUsingShell:(NSString*)shell error:(NSError**)error {
-  GCTask* task = [[GCTask alloc] initWithExecutablePath:shell];
-  NSData* data;
-  // `-l` is not supported with `-c` in all shells (tcsh), so try without.
-  // Some shells use quoting of $PATH to trigger POSIX compatibility behavior (fish).
-  // Not all shells support `-n` on `echo`.
-  if (![task runWithArguments:@[ @"-l", @"-c", @"echo \"$PATH\"" ] stdin:NULL stdout:&data stderr:NULL exitStatus:NULL error:error] && ![task runWithArguments:@[ @"-c", @"echo \"$PATH\"" ] stdin:NULL stdout:&data stderr:NULL exitStatus:NULL error:error]) {
-    return nil;
-  }
-  return [[[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] stringByTrimmingCharactersInSet:[NSCharacterSet newlineCharacterSet]];
+  return _GetPATHUsingShell(shell, error);
 }
 
 - (BOOL)runHookWithName:(NSString*)name arguments:(NSArray*)arguments standardInput:(NSString*)standardInput error:(NSError**)error {
