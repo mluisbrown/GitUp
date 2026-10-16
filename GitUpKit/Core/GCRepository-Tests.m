@@ -286,17 +286,55 @@
 
 // The git-lfs tool used to be expected at /usr/local/bin/git-lfs only, so LFS files were
 // silently left unfiltered when it was installed elsewhere e.g. /opt/homebrew/bin (issue #805).
+- (void)testFindExecutableInPATH {
+  NSFileManager* fileManager = [NSFileManager defaultManager];
+  NSString* root = [NSTemporaryDirectory() stringByAppendingPathComponent:[[NSProcessInfo processInfo] globallyUniqueString]];
+  NSString* emptyDirectory = [root stringByAppendingPathComponent:@"empty"];
+  NSString* firstDirectory = [root stringByAppendingPathComponent:@"first"];
+  NSString* secondDirectory = [root stringByAppendingPathComponent:@"second"];
+  NSString* fallbackDirectory = [root stringByAppendingPathComponent:@"fallback"];
+  for (NSString* directory in @[ emptyDirectory, firstDirectory, secondDirectory, fallbackDirectory ]) {
+    XCTAssertTrue([fileManager createDirectoryAtPath:directory withIntermediateDirectories:YES attributes:nil error:NULL]);
+  }
+  NSData* script = [@"#!/bin/sh\nexit 0\n" dataUsingEncoding:NSUTF8StringEncoding];
+  NSString* firstPath = [firstDirectory stringByAppendingPathComponent:@"git-lfs"];
+  NSString* secondPath = [secondDirectory stringByAppendingPathComponent:@"git-lfs"];
+  NSString* fallbackPath = [fallbackDirectory stringByAppendingPathComponent:@"git-lfs"];
+  XCTAssertTrue([fileManager createFileAtPath:secondPath contents:script attributes:@{NSFilePosixPermissions : @0o755}]);
+  XCTAssertTrue([fileManager createFileAtPath:fallbackPath contents:script attributes:@{NSFilePosixPermissions : @0o755}]);
+
+  // Found in PATH, skipping empty components and directories without the tool
+  NSString* PATH = [NSString stringWithFormat:@"::%@:%@:%@", emptyDirectory, firstDirectory, secondDirectory];
+  XCTAssertEqualObjects(GCFindExecutableInPATH(@"git-lfs", PATH, @[ fallbackDirectory ]), secondPath);
+
+  // PATH order wins over later PATH entries and fallbacks
+  XCTAssertTrue([fileManager createFileAtPath:firstPath contents:script attributes:@{NSFilePosixPermissions : @0o755}]);
+  XCTAssertEqualObjects(GCFindExecutableInPATH(@"git-lfs", PATH, @[ fallbackDirectory ]), firstPath);
+
+  // Non-executable files are ignored
+  XCTAssertTrue([fileManager setAttributes:@{NSFilePosixPermissions : @0o644} ofItemAtPath:firstPath error:NULL]);
+  XCTAssertEqualObjects(GCFindExecutableInPATH(@"git-lfs", PATH, @[ fallbackDirectory ]), secondPath);
+
+  // Falls back to the extra directories when not in PATH, or when PATH couldn't be determined
+  XCTAssertEqualObjects(GCFindExecutableInPATH(@"git-lfs", emptyDirectory, @[ fallbackDirectory ]), fallbackPath);
+  XCTAssertEqualObjects(GCFindExecutableInPATH(@"git-lfs", nil, @[ fallbackDirectory ]), fallbackPath);
+
+  // Not found anywhere
+  XCTAssertNil(GCFindExecutableInPATH(@"git-lfs", emptyDirectory, @[]));
+  XCTAssertNil(GCFindExecutableInPATH(@"git-lfs", nil, @[ emptyDirectory ]));
+
+  // Directories with the tool's name are ignored
+  XCTAssertTrue([fileManager createDirectoryAtPath:[emptyDirectory stringByAppendingPathComponent:@"git-lfs"] withIntermediateDirectories:NO attributes:nil error:NULL]);
+  XCTAssertEqualObjects(GCFindExecutableInPATH(@"git-lfs", emptyDirectory, @[ fallbackDirectory ]), fallbackPath);
+
+  XCTAssertTrue([fileManager removeItemAtPath:root error:NULL]);
+}
+
+// Smoke test with the real git-lfs tool
 - (void)testGitLFSCleanFilter {
   NSString* shell = NSProcessInfo.processInfo.environment[@"SHELL"] ?: @"/bin/sh";
   NSString* PATH = [self.repository getPATHUsingShell:shell error:NULL];
-  BOOL found = NO;
-  for (NSString* directory in [[PATH componentsSeparatedByString:@":"] arrayByAddingObjectsFromArray:@[ @"/opt/homebrew/bin", @"/usr/local/bin", @"/opt/local/bin" ]]) {
-    if (directory.length && [[NSFileManager defaultManager] isExecutableFileAtPath:[directory stringByAppendingPathComponent:@"git-lfs"]]) {
-      found = YES;
-      break;
-    }
-  }
-  if (!found) {
+  if (!GCFindExecutableInPATH(@"git-lfs", PATH, GCDefaultExecutableDirectories())) {
     XCTSkip(@"git-lfs is not installed");
   }
 

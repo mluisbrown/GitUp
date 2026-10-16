@@ -63,8 +63,31 @@ static NSString* _GetPATHUsingShell(NSString* shell, NSError** error) {
   return [[[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] stringByTrimmingCharactersInSet:[NSCharacterSet newlineCharacterSet]];
 }
 
+NSArray<NSString*>* GCDefaultExecutableDirectories(void) {
+  return @[ @"/opt/homebrew/bin", @"/usr/local/bin", @"/opt/local/bin" ];
+}
+
+NSString* GCFindExecutableInPATH(NSString* name, NSString* PATH, NSArray<NSString*>* fallbackDirectories) {
+  NSMutableArray* directories = [[NSMutableArray alloc] init];
+  for (NSString* directory in [PATH componentsSeparatedByString:@":"]) {
+    if (directory.length) {
+      [directories addObject:directory];
+    }
+  }
+  [directories addObjectsFromArray:fallbackDirectories];
+  NSFileManager* fileManager = [NSFileManager defaultManager];
+  for (NSString* directory in directories) {
+    NSString* path = [directory stringByAppendingPathComponent:name];
+    BOOL isDirectory;
+    if ([fileManager fileExistsAtPath:path isDirectory:&isDirectory] && !isDirectory && [fileManager isExecutableFileAtPath:path]) {
+      return path;
+    }
+  }
+  return nil;
+}
+
 // GUI apps don't inherit the user's shell PATH, so git-lfs is looked up in the login shell PATH first
-// and then in the usual install locations (Homebrew on Apple Silicon and Intel, MacPorts).
+// and then in the usual install locations.
 // This is resolved lazily the first time a file with the "lfs" filter attribute is processed.
 static NSString* _GitLFSExecutablePath(NSString** outPATH) {
   static NSString* executablePath = nil;
@@ -73,21 +96,7 @@ static NSString* _GitLFSExecutablePath(NSString** outPATH) {
   dispatch_once(&onceToken, ^{
     @autoreleasepool {
       PATH = _GetPATHUsingShell(NSProcessInfo.processInfo.environment[@"SHELL"], NULL) ?: _GetPATHUsingShell(@"/bin/sh", NULL);
-      NSMutableArray* directories = [[NSMutableArray alloc] init];
-      for (NSString* directory in [PATH componentsSeparatedByString:@":"]) {
-        if (directory.length) {
-          [directories addObject:directory];
-        }
-      }
-      [directories addObjectsFromArray:@[ @"/opt/homebrew/bin", @"/usr/local/bin", @"/opt/local/bin" ]];
-      NSFileManager* fileManager = [NSFileManager defaultManager];
-      for (NSString* directory in directories) {
-        NSString* path = [directory stringByAppendingPathComponent:@"git-lfs"];
-        if ([fileManager isExecutableFileAtPath:path]) {
-          executablePath = path;
-          break;
-        }
-      }
+      executablePath = GCFindExecutableInPATH(@"git-lfs", PATH, GCDefaultExecutableDirectories());
       if (executablePath) {
         XLOG_VERBOSE(@"Using git-lfs tool at \"%@\"", executablePath);
       } else {
